@@ -3,102 +3,96 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
-
-__global__ void flash_attn_v1_kernel(const float *Q,
-                                     const float *K,
-                                     const float *V,
-                                     const int N,
-                                     const int d,
-                                     const int Tc,
-                                     const int Tr,
-                                     const int Bc,
-                                     const int Br,
-                                     const float softmax_scale,
-                                     float *l,
-                                     float *m,
-                                     float *O)
+__global__ void flash_attn_v1_kernel(
+    const float *Q, const float *K, const float *V,
+    const int N, const int d, const int Tc, const int Tr,
+    const int Bc, const int Br, const float softmax_scale,
+    float *l, float *m, float *O)
 {
-    int tx = threadIdx.x;
-    int bx = blockIdx.x;
-    int by = blockIdx.y; // batch and head index
+    const int bx = blockIdx.x;  // batch index
+    const int by = blockIdx.y;  // head index
+    const int tx = threadIdx.x;  // br index
+    const int nh = gridDim.y;  // # of head
 
-    // Offset into Q,K,V,O,l,m - different for each batch and head
-    int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d); // gridDim.y = nh
-    int lm_offset = (bx * gridDim.y * N) + (by * N);          // offset for l and m
+    // Calculate base offsets
+    const int qkv_offset = (bx * nh * N * d) + (by * N * d);
+    const int lm_offset  = (bx * nh * N) + (by * N);
 
-    // Define SRAM for Q,K,V,S
+    // Allocate shared memory (SRAM)
     extern __shared__ float sram[];
-    const int KV_TILE_SIZE = Bc * d; // size of Kj, Vj
-    const int Q_TILE_SIZE = Br * d;  // size of Qi
-    // const int S_TILE_SIZE = Br * Bc; // size of Sij = softmax(Qi * Kj^T * softmax_scale)
-    float *Qi = sram;
-    float *Kj = &sram[Q_TILE_SIZE];
-    float *Vj = &sram[Q_TILE_SIZE + KV_TILE_SIZE];
-    float *S = &sram[Q_TILE_SIZE + KV_TILE_SIZE * 2];
+    const int KV_TILE_SIZE = Bc * d;
+    const int Q_TILE_SIZE  = Br * d;
 
-    // outer loop
-    for (int j = 0; j < Tc; j++)
-    {
-        // Load Kj, Vj from HBM to SRAM
-        for (int x = 0; x < d; x++)
-        {
-            Kj[(tx * d) + x] = K[qkv_offset + (KV_TILE_SIZE * j) + (tx * d) + x];
-            Vj[(tx * d) + x] = V[qkv_offset + (KV_TILE_SIZE * j) + (tx * d) + x];
+    float *Qi = sram;
+    float *Kj = Qi + Q_TILE_SIZE;
+    float *Vj = Kj + KV_TILE_SIZE;
+    float *S  = Vj + KV_TILE_SIZE;
+
+    // Iterate over Tc
+    for (int j = 0; j < Tc; j++) {
+        // Load Kj and Vj into shared memory
+        for (int x = 0; x < d; ++x) {
+            int idx = tx * d + x;
+            Kj[idx] = K[qkv_offset + j * KV_TILE_SIZE + idx];
+            Vj[idx] = V[qkv_offset + j * KV_TILE_SIZE + idx];
         }
         __syncthreads();
 
-        for (int i = 0; i < Tr; i++)
-        {
-            if (tx < Br)
-            {
-                // Load Qi to SRAM, l and m to registers
-                for (int x = 0; x < d; x++)
-                {
-                    Qi[(tx * d) + x] = Q[qkv_offset + (Q_TILE_SIZE * i) + (tx * d) + x];
+        // Iterate over Tr
+        for (int i = 0; i < Tr; i++) {
+            if (tx < Br) {
+                // Load Qi into shared memory
+                for (int x = 0; x < d; ++x) {
+                    int idx = tx * d + x;
+                    Qi[idx] = Q[qkv_offset + i * Q_TILE_SIZE + idx];
                 }
-                float row_m_prev = m[lm_offset + (Br * i) + tx];
-                float row_l_prev = l[lm_offset + (Br * i) + tx];
 
-                // S = QK^T, row_m = rowmax(S)
+                // Load previous row l and m
+                int row_idx = lm_offset + i * Br + tx;
+                float row_m_prev = m[row_idx];
+                float row_l_prev = l[row_idx];
+
+                // Compute S = Qi * Kj^T (scaled dot-product)
                 float row_m = -INFINITY;
-                for (int y = 0; y < Bc; y++)
-                {
-                    float sum = 0;
-                    for (int x = 0; x < d; x++)
-                    {
-                        sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
-                    }
-                    sum *= softmax_scale;
-                    S[(Bc * tx) + y] = sum;
+                for (int y = 0; y < Bc; ++y) {
+                    float dot = 0.0f;
+                    for (int x = 0; x < d; ++x)
+                        dot += Qi[tx * d + x] * Kj[y * d + x];
 
-                    if (sum > row_m)
-                        row_m = sum;
+                    float scaled = dot * softmax_scale;
+                    S[tx * Bc + y] = scaled;
+                    row_m = fmaxf(row_m, scaled);
                 }
 
-                // P = exp(S - row_m), row_l = rowsum(P)
-                float row_l = 0;
-                for (int y = 0; y < Bc; y++)
-                {
-                    S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
-                    row_l += S[(Bc * tx) + y];
+                // Compute softmax: P = exp(S - row_m)
+                float row_l = 0.0f;
+                for (int y = 0; y < Bc; ++y) {
+                    float exp_val = __expf(S[tx * Bc + y] - row_m);
+                    S[tx * Bc + y] = exp_val;
+                    row_l += exp_val;
                 }
 
-                // Compute new m and l
-                float row_m_new = max(row_m_prev, row_m);
-                float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + (__expf(row_m - row_m_new) * row_l);
+                // Compute updated m and l using numerically stable update
+                float row_m_new = fmaxf(row_m_prev, row_m);
+                float row_l_new = __expf(row_m_prev - row_m_new) * row_l_prev +
+                                  __expf(row_m - row_m_new) * row_l;
 
-                // Write O, l, m to HBM
-                for (int x = 0; x < d; x++)
-                {
-                    float pv = 0; // Pij * Vj
-                    for (int y = 0; y < Bc; y++)
-                    {
-                        pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
-                    }
-                    O[qkv_offset + (Q_TILE_SIZE * i) + (tx * d) + x] = (1 / row_l_new) * ((row_l_prev * __expf(row_m_prev - row_m_new) * O[qkv_offset + (Q_TILE_SIZE * i) + (tx * d) + x]) + (__expf(row_m - row_m_new) * pv));
+                // Compute and update output O
+                for (int x = 0; x < d; ++x) {
+                    float weighted_sum = 0.0f;
+                    for (int y = 0; y < Bc; ++y)
+                        weighted_sum += S[tx * Bc + y] * Vj[y * d + x];
+
+                    int out_idx = qkv_offset + i * Q_TILE_SIZE + tx * d + x;
+                    float prev_O = O[out_idx];
+                    O[out_idx] = (1.0f / row_l_new) * (
+                        row_l_prev * __expf(row_m_prev - row_m_new) * prev_O +
+                        __expf(row_m - row_m_new) * weighted_sum);
                 }
-                m[lm_offset + (Br * i) + tx] = row_m_new;
-                l[lm_offset + (Br * i) + tx] = row_l_new;
+
+                // Update l and m
+                l[row_idx] = row_l_new;
+                m[row_idx] = row_m_new;
             }
         }
         __syncthreads();
@@ -169,6 +163,7 @@ torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, int Bc_
     // Get maximum shared memory available on the device
     int max_sram_size_per_block;
     cudaDeviceGetAttribute(&max_sram_size_per_block, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    std::cout << "max_sram_size_per_block: " << max_sram_size_per_block << std::endl;
 
     // Check if requested shared memory exceeds device limits
     if (sram_size_bytes > max_sram_size_per_block) {
