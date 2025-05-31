@@ -65,6 +65,77 @@ def calculate_pytorch_attention(
     return output
 
 
+def test_custom_flash_attention(q, k, v, D, Bc, Br, device):
+    # Clear CUDA memory cache and ensure no residual allocations
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # --- 1. Compute output using your custom FlashAttention kernel ---
+    # print("\n--- Running custom FlashAttention kernel ---")
+    q_cont = q.contiguous()
+    k_cont = k.contiguous()
+    v_cont = v.contiguous()
+
+    softmax_scale_kernel = 1.0 / math.sqrt(D)
+
+    # Reset memory stats before benchmarking
+    torch.cuda.reset_peak_memory_stats(device=device)
+    initial_mem_custom = torch.cuda.memory_allocated(device=device)
+
+    start_event_custom = torch.cuda.Event(enable_timing=True)
+    end_event_custom = torch.cuda.Event(enable_timing=True)
+
+    start_event_custom.record()
+    _ = flash_attn_v1_ext.forward(q_cont, k_cont, v_cont, Bc, Br)
+    end_event_custom.record()
+    torch.cuda.synchronize()
+
+    custom_time_ms = start_event_custom.elapsed_time(end_event_custom)
+    peak_mem_custom = torch.cuda.max_memory_allocated(device=device)
+    final_mem_custom = torch.cuda.memory_allocated(device=device)
+
+    # print(f"Custom FlashAttention time: {custom_time_ms:.4f} ms")
+    # print(f"Custom FlashAttention VRAM (allocated before run): {initial_mem_custom / (1024**2):.2f} MB")
+    # print(f"Custom FlashAttention VRAM (peak during run): {peak_mem_custom / (1024**2):.2f} MB")
+    # print(f"Custom FlashAttention VRAM (allocated after run): {final_mem_custom / (1024**2):.2f} MB")
+    return {
+        'duration': custom_time_ms,
+        'peak_memory': peak_mem_custom - initial_mem_custom,
+    }
+
+def test_torch_attention(q, k, v, D, device):
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # print("\n--- Running standard PyTorch attention ---")
+    softmax_scale_pytorch = 1.0 / math.sqrt(D)
+
+    # Reset memory stats before benchmarking
+    torch.cuda.reset_peak_memory_stats(device=device)
+    initial_mem_pytorch = torch.cuda.memory_allocated(device=device)
+
+    start_event_pytorch = torch.cuda.Event(enable_timing=True)
+    end_event_pytorch = torch.cuda.Event(enable_timing=True)
+
+    start_event_pytorch.record()
+    output_pytorch = calculate_pytorch_attention(q, k, v, softmax_scale_pytorch)
+    end_event_pytorch.record()
+    torch.cuda.synchronize()
+
+    pytorch_time_ms = start_event_pytorch.elapsed_time(end_event_pytorch)
+    peak_mem_pytorch = torch.cuda.max_memory_allocated(device=device)
+    final_mem_pytorch = torch.cuda.memory_allocated(device=device)
+    # print(f"Standard PyTorch attention time: {pytorch_time_ms:.4f} ms")
+    # print(f"Standard PyTorch attention VRAM (allocated before run): {initial_mem_pytorch / (1024**2):.2f} MB")
+    # print(f"Standard PyTorch attention VRAM (peak during run): {peak_mem_pytorch / (1024**2):.2f} MB")
+    # print(f"Standard PyTorch attention VRAM (allocated after run): {final_mem_pytorch / (1024**2):.2f} MB")
+
+    return {
+        'duration': pytorch_time_ms,
+        'peak_memory': peak_mem_pytorch - initial_mem_pytorch,
+    }
+
+
 def main():
     args = argument()
     B = args.batch_size
@@ -90,72 +161,17 @@ def main():
     k = torch.randn(B, nh, N, D, dtype=dtype, device=device)
     v = torch.randn(B, nh, N, D, dtype=dtype, device=device)
 
-    # Clear CUDA memory cache and ensure no residual allocations
-    torch.cuda.empty_cache()
-    gc.collect()
+    custom_profile = test_custom_flash_attention(q, k, v, D, Bc, Br, device)
+    pytorch_profile = test_torch_attention(q, k, v, D, device)
 
-    # --- 1. Compute output using your custom FlashAttention kernel ---
-    print("\n--- Running custom FlashAttention kernel ---")
-    try:
-        q_cont = q.contiguous()
-        k_cont = k.contiguous()
-        v_cont = v.contiguous()
-
-        softmax_scale_kernel = 1.0 / math.sqrt(D)
-
-        # Reset memory stats before benchmarking
-        torch.cuda.reset_peak_memory_stats(device=device)
-        initial_mem_custom = torch.cuda.memory_allocated(device=device)
-
-        start_event_custom = torch.cuda.Event(enable_timing=True)
-        end_event_custom = torch.cuda.Event(enable_timing=True)
-
-        start_event_custom.record()
-        _ = flash_attn_v1_ext.forward(q_cont, k_cont, v_cont, Bc, Br)
-        end_event_custom.record()
-        torch.cuda.synchronize()
-
-        custom_time_ms = start_event_custom.elapsed_time(end_event_custom)
-        peak_mem_custom = torch.cuda.max_memory_allocated(device=device)
-        final_mem_custom = torch.cuda.memory_allocated(device=device)
-
-        print(f"Custom FlashAttention time: {custom_time_ms:.4f} ms")
-        print(f"Custom FlashAttention VRAM (allocated before run): {initial_mem_custom / (1024**2):.2f} MB")
-        print(f"Custom FlashAttention VRAM (peak during run): {peak_mem_custom / (1024**2):.2f} MB")
-        print(f"Custom FlashAttention VRAM (allocated after run): {final_mem_custom / (1024**2):.2f} MB")
-
-    except Exception as e:
-        print(f"Error running custom FlashAttention: {e}")
-        return
-
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    print("\n--- Running standard PyTorch attention ---")
-    softmax_scale_pytorch = 1.0 / math.sqrt(D)
-
-    # Reset memory stats before benchmarking
-    torch.cuda.reset_peak_memory_stats(device=device)
-    initial_mem_pytorch = torch.cuda.memory_allocated(device=device)
-
-    start_event_pytorch = torch.cuda.Event(enable_timing=True)
-    end_event_pytorch = torch.cuda.Event(enable_timing=True)
-
-    start_event_pytorch.record()
-    output_pytorch = calculate_pytorch_attention(q, k, v, softmax_scale_pytorch)
-    end_event_pytorch.record()
-    torch.cuda.synchronize()
-
-    pytorch_time_ms = start_event_pytorch.elapsed_time(end_event_pytorch)
-    peak_mem_pytorch = torch.cuda.max_memory_allocated(device=device)
-    final_mem_pytorch = torch.cuda.memory_allocated(device=device)
-
-    print(f"Standard PyTorch attention time: {pytorch_time_ms:.4f} ms")
-    print(f"Standard PyTorch attention VRAM (allocated before run): {initial_mem_pytorch / (1024**2):.2f} MB")
-    print(f"Standard PyTorch attention VRAM (peak during run): {peak_mem_pytorch / (1024**2):.2f} MB")
-    print(f"Standard PyTorch attention VRAM (allocated after run): {final_mem_pytorch / (1024**2):.2f} MB")
-
+    custom_time_ms = custom_profile['duration']
+    pytorch_time_ms = pytorch_profile['duration']
+    peak_mem_custom = custom_profile['peak_memory']
+    peak_mem_pytorch = pytorch_profile['peak_memory']
+    
     print(f"\n--- Summary ---")
+    print(f"Custom FlashAttention duration: {custom_time_ms:.2f}ms")
+    print(f"Torch Attention duration: {pytorch_time_ms:.2f}ms")
     print(f"Performance comparison: Custom FlashAttention was {pytorch_time_ms / custom_time_ms:.2f}x faster than standard PyTorch attention.")
     print(f"VRAM Peak comparison: Standard PyTorch attention used {peak_mem_pytorch / (1024**2):.2f} MB (peak), Custom FlashAttention used {peak_mem_custom / (1024**2):.2f} MB (peak).")
     print(f"FlashAttention saved {(peak_mem_pytorch - peak_mem_custom) / (1024**2):.2f} MB of VRAM (or {(1 - peak_mem_custom / peak_mem_pytorch) * 100:.2f}% reduction).")
