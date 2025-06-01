@@ -174,7 +174,7 @@ torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, int Bc_
 
     // Define Grid and Block dimensions for kernel launch
     dim3 grid_dim(B, nh);       // Grid: (Batch_size, Num_heads)
-    dim3 block_dim(Br_arg);     // Block: (Br_arg threads per block)
+    dim3 block_dim(Bc_arg);     // Block: (Br_arg threads per block)
                                 // Each thread will compute a row of Qi or O, up to Br rows.
                                 // If tx < Br is checked, all threads in block_dim.x must be <= Br.
                                 // Setting block_dim.x = Br_arg ensures all threads are utilized for the 'if (tx < Br)' path.
