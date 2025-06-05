@@ -7,6 +7,8 @@ $ python3 setup.py install
 
 ## Usage
 ```sh
+python3 benchmark.py
+
 usage: Benchmark settings [-h] [-b BATCH_SIZE] [-nh HEAD] [-n LENGTH] [-d DIMENSION] [--bc BC] [--br BR]
 
 optional arguments:
